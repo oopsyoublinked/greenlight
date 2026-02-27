@@ -1,13 +1,11 @@
 import os
-import math
-import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 
 import numpy as np
 import pandas as pd
-import requests
 import pytz
+import requests
 import yfinance as yf
 from sqlalchemy import create_engine, text
 
@@ -17,8 +15,6 @@ from sqlalchemy import create_engine, text
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-
-AUTO_SIM_DAYS = int(os.getenv("AUTO_SIM_DAYS", "5"))
 
 # Universe: liquid ETFs + mega caps
 UNIVERSE = [
@@ -38,6 +34,34 @@ CHASE_YELLOW_MAX = 1.5
 HTTP_TIMEOUT = 20
 
 # =========================
+# TIME HELPERS
+# =========================
+
+def now_ct_str() -> str:
+    try:
+        central = pytz.timezone("US/Central")
+        return datetime.now(central).strftime("%Y-%m-%d %I:%M %p CT")
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+def is_market_hours_et() -> bool:
+    """
+    Mon-Fri 9:30am to 4:00pm ET
+    """
+    eastern = pytz.timezone("US/Eastern")
+    now = datetime.now(eastern)
+
+    # 0=Mon ... 6=Sun
+    if now.weekday() >= 5:
+        return False
+
+    minutes = now.hour * 60 + now.minute
+    market_open = 9 * 60 + 30
+    market_close = 16 * 60
+
+    return market_open <= minutes <= market_close
+
+# =========================
 # DISCORD
 # =========================
 
@@ -48,13 +72,6 @@ def send_discord(msg: str) -> None:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=HTTP_TIMEOUT)
     except Exception as e:
         print("Discord send failed:", str(e))
-
-def now_ct_str() -> str:
-    try:
-        central = pytz.timezone("US/Central")
-        return datetime.now(central).strftime("%Y-%m-%d %I:%M %p CT")
-    except Exception:
-        return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
 # =========================
 # INDICATORS
@@ -179,14 +196,12 @@ def build_plan_v1(ticker: str) -> Plan | None:
 
     direction = "Bullish" if bullish else "Bearish"
 
-    # Stop and target using ATR (targets about 2R)
     stop_dist = a * 1.2
     target_dist = stop_dist * 2.0
     stop = last - stop_dist if direction == "Bullish" else last + stop_dist
     target = last + target_dist if direction == "Bullish" else last - target_dist
     rr_val = abs(target - last) / max(abs(last - stop), 1e-9)
 
-    # Momentum proxy: EMA20 slope over ~20 bars
     if len(ema20_s) >= 21:
         ema20_prev = float(ema20_s.iloc[-20])
     else:
@@ -195,7 +210,6 @@ def build_plan_v1(ticker: str) -> Plan | None:
     ema_slope = (ema20 - ema20_prev) / max(abs(ema20_prev), 1e-9)
     momentum_score = float(np.clip((ema_slope * 100) * 2 + 5, 0, 10))
 
-    # Confidence: baseline + momentum + lower volatility preference
     confidence = float(np.clip((10.0 * 0.45 + momentum_score * 0.35 + (10 - vol_risk) * 0.20), 0, 10))
 
     grade, dot = grade_from_metrics(confidence, rr_val, vol_risk)
@@ -314,13 +328,12 @@ def save_plays(engine, plans: list[Plan]) -> None:
             )
 
 # =========================
-# CHANGE DETECTION + ALERT
+# CHANGE DETECTION + ALERTS
 # =========================
 
 def primary_key(plan: Plan | None) -> str:
     if plan is None:
         return "NONE"
-    # Include the pieces that matter for decisions
     return f"{plan.ticker}|{plan.direction}|{plan.grade}"
 
 def format_play(plan: Plan) -> str:
@@ -341,19 +354,14 @@ def alert_if_changed(engine, primary: Plan | None, backups: list[Plan]) -> None:
     if new_key == old_key:
         return
 
-    # Persist new key
     write_meta(engine, "last_primary_key", new_key)
 
-    # Send alert
     header = f"📣 **Greenlight update** ({now_ct_str()})\n"
     if primary is None:
-        msg = header + "No Grade A or B setups right now. No trade is a valid outcome."
-        send_discord(msg)
+        send_discord(header + "No Grade A or B setups right now. No trade is a valid outcome.")
         return
 
-    lines = [header]
-    lines.append("**PRIMARY PLAY changed**")
-    lines.append(format_play(primary))
+    lines = [header, "**PRIMARY PLAY changed**", format_play(primary)]
 
     if backups:
         lines.append("\n**BACKUPS**")
@@ -370,6 +378,11 @@ def alert_if_changed(engine, primary: Plan | None, backups: list[Plan]) -> None:
 def main():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set")
+
+    if not is_market_hours_et():
+        print("Outside market hours ET, skipping.")
+        return
+
     engine = get_engine()
     ensure_tables(engine)
 
@@ -385,13 +398,13 @@ def main():
     primary = top3[0] if len(top3) >= 1 else None
     backups = top3[1:3] if len(top3) > 1 else []
 
-    # Save current plays to DB (even if empty)
     save_plays(engine, top3)
-
-    # Heartbeat rule D: only alert on meaningful change (primary key change)
     alert_if_changed(engine, primary, backups)
 
-    print(f"{datetime.utcnow().isoformat(timespec='seconds')} plans={len(plans)} top_saved={len(top3)} primary={primary_key(primary)}")
+    print(
+        f"{datetime.utcnow().isoformat(timespec='seconds')} "
+        f"plans={len(plans)} top_saved={len(top3)} primary={primary_key(primary)}"
+    )
 
 if __name__ == "__main__":
     main()
